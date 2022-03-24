@@ -1,0 +1,140 @@
+
+
+
+######train_dataset = ImagenetDataset(args.datasets, args.cache_path, transform=train_transform,target_transform=target_transform)
+#####train_loader = DataLoader(train_dataset, args.batch_size,num_workers=args.num_workers,shuffle=True)
+
+
+import numpy as np
+import pathlib
+import os
+import tensorflow as tf
+from tqdm import tqdm
+from PIL import Image
+import pickle
+import cv2
+
+class ImagenetDataset:
+
+	def __init__(self, data_train,data_test, root, transform=None, target_transform=None, is_val=False, keep_difficult=False, label_file=None):
+		"""Dataset for VID data.
+		Args:
+			data: path to tfrecord file 
+			root: the path of root directory of cache
+			transform : object of transform class to do the augmentation for the images 
+			target_transform : object of target_transform class for genrating the priors 
+		"""
+		self.data_train=data_train
+    self.data_test=data_test
+		self.root = pathlib.Path(root)
+		self.transform = transform
+		self.target_transform = target_transform
+		self.is_val = is_val
+		if is_val:
+			self.data = tf.data.TFRecordDataset(tf.io.gfile.glob(self.data_test)) 
+		else:
+			self.data = tf.data.TFRecordDataset(tf.io.gfile.glob(self.data_train))
+		self.count=0
+		self._classes_names = ['xxx','yyy','zzz'] #######change code 
+		self._classes_map = {'xxx':0, 'yyy':1,'zzz':2}#######change code 
+		for i in (self.data):
+			self.count+=1
+
+		self.db = self.gt_roidb() 
+			
+	def __len__(self):
+		return self.count
+
+	def gt_roidb(self):
+		if self.is_val:
+			cache_file = os.path.join(self.root, 'val_VID_gt_db.pkl')
+			image_dir=os.path.join(self.root,'image_files_val')
+		else:
+			cache_file = os.path.join(self.root, 'train_VID_gt_db.pkl')
+			image_dir=os.path.join(self.root,'image_files_train')
+		if os.path.exists(cache_file):
+			with open(cache_file, 'rb') as fid:
+				roidb = pickle.load(fid)
+			logging.info('gt roidb loaded from {}'.format(cache_file))
+			return roidb
+
+		
+		if not os.path.exists(image_dir):
+			os.makedirs(image_dir)
+		gt_roidb = []
+		def parse(feature):
+			return tf.io.parse_single_example(feature,features={'image/height': tf.io.FixedLenFeature([], tf.int64),
+			'image/width': tf.io.FixedLenFeature([], tf.int64),
+			'image/filename': tf.io.FixedLenFeature([], tf.string),
+			'image/source_id': tf.io.FixedLenFeature([], tf.string),
+			'image/key/sha256': tf.io.FixedLenFeature([], tf.string),
+			'image/encoded': tf.io.FixedLenFeature([], tf.string),
+			'image/format': tf.io.FixedLenFeature([], tf.string),
+			'image/object/bbox/xmin': tf.io.VarLenFeature(tf.float32),
+			'image/object/bbox/xmax': tf.io.VarLenFeature(tf.float32),
+			'image/object/bbox/ymin': tf.io.VarLenFeature(tf.float32),
+			'image/object/bbox/ymax': tf.io.VarLenFeature(tf.float32),
+			'image/object/class/text': tf.io.VarLenFeature(tf.string),
+			'image/object/class/label': tf.io.VarLenFeature(tf.int64),
+			'image/object/difficult': tf.io.VarLenFeature(tf.int64),
+			'image/object/truncated': tf.io.VarLenFeature(tf.int64),
+			'image/object/crowded': tf.io.VarLenFeature(tf.int64)})
+		count=0
+		for i in tqdm(self.data):
+			count+=1
+			features=parse(i)
+
+			input_image = tf.image.decode_jpeg(features['image/encoded'],channels=3)
+			image = tf.keras.utils.array_to_img(input_image)
+			file_name=f"image000{count}.jpg"
+			image_path=os.path.join(image_dir,file_name)
+			image.save(image_path)
+		
+#for the following 6 lines i have used sparse.tensor.values as my features were linear , if you have multidimension use tf.sparse.to_dense(x).numpy()
+			xmins=features['image/object/bbox/xmin'].values.numpy()
+			xmaxs=features['image/object/bbox/xmax'].values.numpy()
+			ymins=features['image/object/bbox/ymin'].values.numpy()
+			ymaxs=features['image/object/bbox/ymax'].values.numpy()
+		
+		
+		
+			classes=features['image/object/class/label'].values.numpy()
+			classes_text=features['image/object/class/text'].values.numpy()
+			boxes=[]
+			labels=[]
+			record={}
+			for i  in range(len(classes)):
+				boxes.append([xmins[i],ymins[i],xmaxs[i],ymaxs[i]])
+				labels.append(int(classes[i]-1))
+			record['image_path']=image_path
+			record['boxes']=np.array(boxes, dtype=np.float32)
+			record['labels']=np.array(labels, dtype=np.int64)
+			gt_roidb.append(record)
+		
+
+		with open(cache_file, 'wb') as fid:
+			pickle.dump(gt_roidb, fid, pickle.HIGHEST_PROTOCOL)
+		logging.info('wrote gt roidb to {}'.format(cache_file))
+
+		return gt_roidb
+
+
+
+	def __getitem__(self, index):	
+		data=self.db[index]
+		image=self._read_image(data['image_path'])
+		boxes=data['boxes']
+		labels=data['labels']
+		if self.transform:
+			image, boxes, labels = self.transform(image, boxes, labels)
+		if self.target_transform:
+			boxes, labels = self.target_transform(boxes, labels)
+		return image, boxes, labels
+
+
+	def _read_image(self, image_file):
+		image = cv2.imread(str(image_file))
+		image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+		#### if you are changing dimension  of image remmeber to change the box features tooo ...image= cv2.resize(image, (320,320),interpolation = cv2.INTER_NEAREST)
+
+		return image
